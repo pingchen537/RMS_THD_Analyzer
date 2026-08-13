@@ -305,10 +305,6 @@ RMS-THD-Analyzer/
    ├─ rms_compare_example.png
    └─ thd_compare_example.png
 ```
-
-`requirements.txt` 可寫成：
-
-```text
 matplotlib>=3.7
 ```
 
