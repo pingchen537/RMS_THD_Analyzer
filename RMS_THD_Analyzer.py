@@ -1,8 +1,7 @@
-
-r"""Audio Precision RMS / THD CSV 分析工具（單檔版）。
+r"""Audio Precision RMS / THD / THD+N CSV 分析工具（單檔版）。
 
 主要功能：
-1. 解析 AP 匯出的多區塊 RMS Level / THD Ratio CSV。
+1. 解析 AP 匯出的多區塊 RMS Level / THD Ratio / THD+N CSV。
 2. 輸出彙整 CSV、各 DUT CSV、個別曲線圖與疊圖比較。
 3. 可用 DUT 編號或完整名稱選擇 RMS / THD 比較曲線。
 4. 支援互動模式：CSV 只解析一次，可連續建立多組比較圖。
@@ -30,7 +29,8 @@ import csv
 import math
 import re
 import sys
-from collections import Counter, defaultdict
+import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,16 +45,17 @@ from matplotlib.ticker import FuncFormatter, MultipleLocator
 # =============================================================================
 
 # 1-1. 規格上下限；不使用時設為 None。
-RMS_USL = None                 # dBSPL，例如 110.0
-RMS_LSL = None                 # dBSPL，例如 75.0
-THD_USL = None                 # %，例如 10.0
+# RMS 單位會跟隨輸入 CSV（例如 dBSPL 或 dBFS）；THD / THD+N 必須為 %。
+RMS_USL = None                 # 例如 110.0
+RMS_LSL = None                 # 例如 75.0
+THD_USL = None                 # %，例如 10.0；THD+N 也沿用此設定
 THD_LSL = None                 # %，通常不設定
 
 # 1-2. 圖形顯示及 CSV 輸出的頻率範圍。
 FREQUENCY_RANGE_HZ = (100.0, 10_000.0)
 
 # 1-3. Y 軸範圍與格線；設為 None 代表自動。
-RMS_Y_RANGE = (20.0, 120.0)   # dBSPL；若要顯示 50～60，改為 (50.0, 60.0)
+RMS_Y_RANGE = (20.0, 120.0)   # 單位同輸入；若要顯示 50～60，改為 (50.0, 60.0)
 RMS_Y_GRID_INTERVAL = 2.0     # 每條水平格線相差 2 dB；None = 自動
 THD_Y_RANGE = (0.05, 100.0)   # %；對數軸時上下限必須大於 0
 THD_Y_SCALE = "log"           # "log" 或 "linear"
@@ -80,8 +81,8 @@ CREATE_ONE_CSV_PER_DUT = True
 # 無論是否使用時間標籤，程式都不會沿用既有資料夾；撞名時會加 _001、_002……。
 ADD_OUTPUT_TIMESTAMP = True
 
-# AP 有時把 RMS 名稱匯出成 Ch1，但相同量測順序的 THD 保留 DUT 名稱。
-# True：RMS / THD 區塊數相同時，依量測順序自動配對名稱。
+# AP 有時把 RMS 名稱匯出成 Ch1，但相同量測順序的失真曲線保留 DUT 名稱。
+# True：RMS / 失真區塊數相同時，依量測順序自動配對名稱。
 AUTO_MATCH_GENERIC_CHANNEL_NAMES = True
 
 # =============================================================================
@@ -92,6 +93,7 @@ AUTO_MATCH_GENERIC_CHANNEL_NAMES = True
 @dataclass
 class MeasurementBlock:
     kind: str                 # "RMS" or "THD"
+    metric: str               # "RMS", "THD", or "THD+N"
     name: str
     unit: str
     points: list[tuple[float, float]]
@@ -108,6 +110,11 @@ AP_FREQUENCY_TICKS = [
 THD_LOG_TICKS = [0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5,
                  1, 2, 3, 5, 10, 20, 30, 50, 100]
 MAX_LABELED_RMS_GRID_LINES = 15
+WINDOWS_RESERVED_FILENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 
 
 # =============================================================================
@@ -144,11 +151,17 @@ def parse_ap_csv(path: Path) -> list[MeasurementBlock]:
 
     while index < len(rows):
         title = rows[index][0] if rows[index] else ""
-        is_summary = title.casefold().startswith("summary:")
-        if not is_summary and "THD Ratio" in title:
+        normalized_title = title.casefold()
+        is_summary = normalized_title.startswith("summary:")
+        if not is_summary and re.search(r"\bthd\s*\+\s*n\b", normalized_title):
             kind = "THD"
-        elif not is_summary and "RMS Level" in title:
+            metric = "THD+N"
+        elif not is_summary and "thd ratio" in normalized_title:
+            kind = "THD"
+            metric = "THD"
+        elif not is_summary and "rms level" in normalized_title:
             kind = "RMS"
+            metric = "RMS"
         else:
             index += 1
             continue
@@ -173,7 +186,7 @@ def parse_ap_csv(path: Path) -> list[MeasurementBlock]:
                 f"Block {block_number} ({kind}, {name!r}) has no frequency units row."
             )
 
-        unit = rows[units_row][1] if len(rows[units_row]) > 1 else ("%" if kind == "THD" else "dBSPL")
+        unit = rows[units_row][1] if len(rows[units_row]) > 1 else ""
         points: list[tuple[float, float]] = []
         cursor = units_row + 1
         while cursor < len(rows):
@@ -185,12 +198,69 @@ def parse_ap_csv(path: Path) -> list[MeasurementBlock]:
 
         if not points:
             raise ValueError(f"Block {block_number} ({kind}, {name!r}) contains no numeric data.")
-        blocks.append(MeasurementBlock(kind, name, unit, points, block_number))
+        blocks.append(MeasurementBlock(kind, metric, name, unit, points, block_number))
         index = max(cursor, index + 1)
 
     if not blocks:
-        raise ValueError("No 'RMS Level' or 'THD Ratio' data blocks were found in the CSV.")
+        raise ValueError(
+            "No 'RMS Level', 'THD Ratio', or 'THD+N' data blocks were found in the CSV."
+        )
     return blocks
+
+
+def _canonical_unit(unit: str) -> str:
+    """Normalize common AP unit spellings without changing the numeric values."""
+    compact = re.sub(r"\s+", "", unit).casefold()
+    aliases = {
+        "%": "%",
+        "percent": "%",
+        "pct": "%",
+        "dbspl": "dBSPL",
+        "dbfs": "dBFS",
+        "dbv": "dBV",
+        "vrms": "Vrms",
+        "v": "V",
+    }
+    return aliases.get(compact, unit.strip())
+
+
+def validate_measurement_metadata(
+    blocks: Sequence[MeasurementBlock],
+) -> tuple[str, str]:
+    """Return the RMS unit and distortion metric after consistency checks."""
+    rms_blocks = [block for block in blocks if block.kind == "RMS"]
+    distortion_blocks = [block for block in blocks if block.kind == "THD"]
+
+    for block in blocks:
+        block.unit = _canonical_unit(block.unit)
+        if not block.unit:
+            raise ValueError(
+                f"Block {block.source_block_number} ({block.metric}, {block.name!r}) "
+                "has no measurement unit."
+            )
+
+    rms_units = {block.unit for block in rms_blocks}
+    if len(rms_units) != 1:
+        raise ValueError(
+            "RMS blocks use inconsistent units: " + ", ".join(sorted(rms_units))
+        )
+
+    distortion_units = {block.unit for block in distortion_blocks}
+    if distortion_units != {"%"}:
+        shown = ", ".join(sorted(distortion_units)) or "none"
+        raise ValueError(
+            "THD / THD+N data must use percent (%). "
+            f"Detected unit(s): {shown}. dB values are not converted automatically."
+        )
+
+    distortion_metrics = {block.metric for block in distortion_blocks}
+    if len(distortion_metrics) != 1:
+        raise ValueError(
+            "The same CSV cannot mix THD Ratio and THD+N blocks. "
+            "Export one distortion metric at a time."
+        )
+
+    return next(iter(rms_units)), next(iter(distortion_metrics))
 
 
 def reconcile_dut_names(blocks: list[MeasurementBlock]) -> list[str]:
@@ -255,8 +325,40 @@ def _frequency_in_range(frequency: float) -> bool:
 
 
 def _safe_filename(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    return cleaned or "DUT"
+    """Create a Windows-safe filename stem while preserving readable Unicode."""
+    normalized = unicodedata.normalize("NFKC", name)
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", normalized)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
+    if not cleaned:
+        cleaned = "DUT"
+    if cleaned.upper() in WINDOWS_RESERVED_FILENAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned[:120].rstrip(". ") or "DUT"
+
+
+def _unique_filename_stems(names: Sequence[str]) -> dict[str, str]:
+    """Return deterministic, case-insensitively unique filename stems."""
+    stems: dict[str, str] = {}
+    used: set[str] = set()
+    for name in names:
+        base = _safe_filename(name)
+        candidate = base
+        sequence = 2
+        while candidate.casefold() in used:
+            suffix = f"_{sequence:03d}"
+            candidate = f"{base[:120 - len(suffix)].rstrip()}{suffix}"
+            sequence += 1
+        used.add(candidate.casefold())
+        stems[name] = candidate
+    return stems
+
+
+def _column_unit_token(unit: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", unit).strip("_") or "Value"
+
+
+def _distortion_token(metric: str) -> str:
+    return "THD_N" if metric == "THD+N" else "THD"
 
 
 def _number_text(value: float | None) -> str:
@@ -295,15 +397,21 @@ def write_long_csv(
     path: Path,
     rms_data: dict[str, dict[float, float]],
     thd_data: dict[str, dict[float, float]],
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     """輸出長表：每列為 DUT + 頻率，並包含上下限與 PASS/FAIL。"""
     all_names = list(dict.fromkeys([*rms_data, *thd_data]))
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
+        rms_unit_token = _column_unit_token(rms_unit)
+        distortion_token = _distortion_token(distortion_metric)
         writer.writerow([
-            "DUT_ID", "Frequency_Hz", "RMS_Level_dBSPL", "THD_Percent",
-            "RMS_LSL_dBSPL", "RMS_USL_dBSPL", "RMS_Result",
-            "THD_LSL_Percent", "THD_USL_Percent", "THD_Result",
+            "DUT_ID", "Frequency_Hz",
+            f"RMS_Level_{rms_unit_token}", f"{distortion_token}_Percent",
+            f"RMS_LSL_{rms_unit_token}", f"RMS_USL_{rms_unit_token}", "RMS_Result",
+            f"{distortion_token}_LSL_Percent", f"{distortion_token}_USL_Percent",
+            f"{distortion_token}_Result",
         ])
         for name in all_names:
             frequencies = sorted({*rms_data.get(name, {}), *thd_data.get(name, {})})
@@ -323,18 +431,25 @@ def write_per_dut_csvs(
     output_dir: Path,
     rms_data: dict[str, dict[float, float]],
     thd_data: dict[str, dict[float, float]],
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     """每個 DUT 各輸出一份 RMS 與 THD CSV，並將 DUT 名稱寫入量測欄名。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     all_names = list(dict.fromkeys([*rms_data, *thd_data]))
+    filename_stems = _unique_filename_stems(all_names)
+    rms_unit_token = _column_unit_token(rms_unit)
+    distortion_token = _distortion_token(distortion_metric)
     for name in all_names:
-        path = output_dir / f"{_safe_filename(name)}.csv"
+        path = output_dir / f"{filename_stems[name]}.csv"
         frequencies = sorted({*rms_data.get(name, {}), *thd_data.get(name, {})})
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow([
-                "Frequency_Hz", f"{name}_RMS_Level_dBSPL", f"{name}_THD_Percent",
-                "RMS_Result", "THD_Result",
+                "Frequency_Hz",
+                f"{name}_RMS_Level_{rms_unit_token}",
+                f"{name}_{distortion_token}_Percent",
+                "RMS_Result", f"{distortion_token}_Result",
             ])
             for frequency in frequencies:
                 if not _frequency_in_range(frequency):
@@ -363,7 +478,12 @@ def _plain_tick_label(value: float, _position: int) -> str:
     return f"{value:g}"
 
 
-def _configure_axis(ax: plt.Axes, measurement: str) -> None:
+def _configure_axis(
+    ax: plt.Axes,
+    measurement: str,
+    rms_unit: str,
+    distortion_metric: str,
+) -> None:
     low_frequency, high_frequency = FREQUENCY_RANGE_HZ
     ax.set_xscale("log")
     ax.set_xlim(low_frequency, high_frequency)
@@ -373,7 +493,7 @@ def _configure_axis(ax: plt.Axes, measurement: str) -> None:
     ax.set_xlabel("Frequency (Hz)")
 
     if measurement == "RMS":
-        ax.set_ylabel("RMS Level (dBSPL)")
+        ax.set_ylabel(f"RMS Level ({rms_unit})")
         if RMS_Y_RANGE is not None:
             ax.set_ylim(*RMS_Y_RANGE)
         if RMS_Y_GRID_INTERVAL is not None:
@@ -387,7 +507,7 @@ def _configure_axis(ax: plt.Axes, measurement: str) -> None:
                 ax.yaxis.set_major_locator(MultipleLocator(RMS_Y_GRID_INTERVAL * 5))
                 ax.yaxis.set_minor_locator(MultipleLocator(RMS_Y_GRID_INTERVAL))
     else:
-        ax.set_ylabel("THD Ratio (%)")
+        ax.set_ylabel(f"{distortion_metric} (%)")
         ax.set_yscale(THD_Y_SCALE)
         if THD_Y_RANGE is not None:
             ax.set_ylim(*THD_Y_RANGE)
@@ -424,6 +544,8 @@ def save_plot(
     selected_names: Sequence[str],
     measurement: str,
     title: str,
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     """儲存一張 RMS 或 THD 圖，可包含一條或多條 DUT 曲線。"""
     fig, ax = plt.subplots(figsize=FIGURE_SIZE)
@@ -432,7 +554,7 @@ def save_plot(
         ax.plot(x_values, y_values, linewidth=LINE_WIDTH, label=name)
 
     _draw_limits(ax, measurement)
-    _configure_axis(ax, measurement)
+    _configure_axis(ax, measurement, rms_unit, distortion_metric)
     ax.set_title(title)
     ax.legend(loc="best", fontsize=max(8, FONT_SIZE - 1), framealpha=0.92)
     fig.tight_layout()
@@ -504,19 +626,27 @@ def create_individual_plots(
     output_dir: Path,
     rms_data: dict[str, dict[float, float]],
     thd_data: dict[str, dict[float, float]],
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     if not CREATE_INDIVIDUAL_PLOTS:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
+    filename_stems = _unique_filename_stems(
+        list(dict.fromkeys([*rms_data, *thd_data]))
+    )
+    distortion_file_token = _distortion_token(distortion_metric)
     for name in rms_data:
         save_plot(
-            output_dir / f"{_safe_filename(name)}_RMS_Level.png",
+            output_dir / f"{filename_stems[name]}_RMS_Level.png",
             rms_data, [name], "RMS", f"RMS Level — {name}",
+            rms_unit, distortion_metric,
         )
     for name in thd_data:
         save_plot(
-            output_dir / f"{_safe_filename(name)}_THD.png",
-            thd_data, [name], "THD", f"THD Ratio — {name}",
+            output_dir / f"{filename_stems[name]}_{distortion_file_token}.png",
+            thd_data, [name], "THD", f"{distortion_metric} — {name}",
+            rms_unit, distortion_metric,
         )
 
 
@@ -526,21 +656,27 @@ def create_comparison_plots(
     thd_data: dict[str, dict[float, float]],
     rms_requested: Sequence[str] | None,
     thd_requested: Sequence[str] | None,
+    rms_unit: str,
+    distortion_metric: str,
     rms_filename: str = "RMS_Level_Comparison.png",
-    thd_filename: str = "THD_Comparison.png",
+    thd_filename: str | None = None,
 ) -> tuple[list[str], list[str]]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if thd_filename is None:
+        thd_filename = f"{_distortion_token(distortion_metric)}_Comparison.png"
     rms_selection = _resolve_selection(rms_requested, list(rms_data), "RMS")
     thd_selection = _resolve_selection(thd_requested, list(thd_data), "THD")
     if rms_selection:
         save_plot(
             output_dir / rms_filename,
             rms_data, rms_selection, "RMS", "RMS Level Comparison",
+            rms_unit, distortion_metric,
         )
     if thd_selection:
         save_plot(
             output_dir / thd_filename,
-            thd_data, thd_selection, "THD", "THD Ratio Comparison",
+            thd_data, thd_selection, "THD", f"{distortion_metric} Comparison",
+            rms_unit, distortion_metric,
         )
     return rms_selection, thd_selection
 
@@ -551,29 +687,43 @@ def create_plots(
     thd_data: dict[str, dict[float, float]],
     rms_requested: Sequence[str] | None,
     thd_requested: Sequence[str] | None,
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     _configure_plot_style()
-    create_individual_plots(output_dir / "individual", rms_data, thd_data)
+    create_individual_plots(
+        output_dir / "individual", rms_data, thd_data,
+        rms_unit, distortion_metric,
+    )
     create_comparison_plots(
         output_dir / "comparison", rms_data, thd_data,
-        rms_requested, thd_requested,
+        rms_requested, thd_requested, rms_unit, distortion_metric,
     )
 
 
 def _print_dut_menu(
     rms_names: Sequence[str],
     thd_names: Sequence[str],
+    distortion_metric: str,
 ) -> None:
     print("\n可選擇的 RMS DUT：")
     for number, name in enumerate(rms_names, start=1):
         print(f"  {number}: {name}")
-    print("可選擇的 THD DUT：")
+    print(f"可選擇的 {distortion_metric} DUT：")
     for number, name in enumerate(thd_names, start=1):
         print(f"  {number}: {name}")
 
 
-def _next_comparison_path(output_dir: Path, measurement: str) -> Path:
-    stem = "RMS_Level_Comparison" if measurement == "RMS" else "THD_Comparison"
+def _next_comparison_path(
+    output_dir: Path,
+    measurement: str,
+    distortion_metric: str,
+) -> Path:
+    stem = (
+        "RMS_Level_Comparison"
+        if measurement == "RMS"
+        else f"{_distortion_token(distortion_metric)}_Comparison"
+    )
     sequence = 1
     while True:
         candidate = output_dir / f"{stem}_{sequence:03d}.png"
@@ -586,12 +736,14 @@ def run_interactive_comparison(
     output_dir: Path,
     rms_data: dict[str, dict[float, float]],
     thd_data: dict[str, dict[float, float]],
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     """CSV 只解析一次，在同一執行階段連續建立多組比較圖。"""
     rms_names = list(rms_data)
     thd_names = list(thd_data)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _print_dut_menu(rms_names, thd_names)
+    _print_dut_menu(rms_names, thd_names, distortion_metric)
     print(
         "\n可用命令：rms 1 2 3 | thd 1,2,3 | both 1 2 | list | help | quit\n"
         "可使用 DUT 編號、完整名稱或 all；每次都會另存新的 PNG，不覆蓋舊圖。"
@@ -612,7 +764,7 @@ def run_interactive_comparison(
         if command in {"quit", "exit", "q"}:
             break
         if command == "list":
-            _print_dut_menu(rms_names, thd_names)
+            _print_dut_menu(rms_names, thd_names, distortion_metric)
             continue
         if command == "help":
             print("範例：rms 1 3 5 | thd all | both 2,4,6 | quit")
@@ -624,13 +776,21 @@ def run_interactive_comparison(
         try:
             if command in {"rms", "both"}:
                 selection = _resolve_selection(requested, rms_names, "RMS")
-                destination = _next_comparison_path(output_dir, "RMS")
-                save_plot(destination, rms_data, selection, "RMS", "RMS Level Comparison")
+                destination = _next_comparison_path(output_dir, "RMS", distortion_metric)
+                save_plot(
+                    destination, rms_data, selection, "RMS", "RMS Level Comparison",
+                    rms_unit, distortion_metric,
+                )
                 print(f"已儲存：{destination.resolve()}")
             if command in {"thd", "both"}:
-                selection = _resolve_selection(requested, thd_names, "THD")
-                destination = _next_comparison_path(output_dir, "THD")
-                save_plot(destination, thd_data, selection, "THD", "THD Ratio Comparison")
+                selection = _resolve_selection(
+                    requested, thd_names, distortion_metric
+                )
+                destination = _next_comparison_path(output_dir, "THD", distortion_metric)
+                save_plot(
+                    destination, thd_data, selection, "THD",
+                    f"{distortion_metric} Comparison", rms_unit, distortion_metric,
+                )
                 print(f"已儲存：{destination.resolve()}")
         except ValueError as error:
             print(f"錯誤：{error}")
@@ -642,10 +802,14 @@ def write_run_notes(
     rms_names: Sequence[str],
     thd_names: Sequence[str],
     warnings: Sequence[str],
+    rms_unit: str,
+    distortion_metric: str,
 ) -> None:
     lines = [
         f"輸入檔案：{input_path.resolve()}",
         f"頻率範圍：{FREQUENCY_RANGE_HZ[0]:g}～{FREQUENCY_RANGE_HZ[1]:g} Hz",
+        f"RMS 單位：{rms_unit}",
+        f"失真測項：{distortion_metric} (%)",
         f"RMS DUTs ({len(rms_names)}): {', '.join(rms_names)}",
         f"THD DUTs ({len(thd_names)}): {', '.join(thd_names)}",
         "",
@@ -683,6 +847,24 @@ def validate_settings() -> None:
     ):
         if lsl is not None and usl is not None and lsl > usl:
             raise ValueError(f"{label}_LSL 不可大於 {label}_USL。")
+
+
+def validate_frequency_coverage(
+    data: dict[str, dict[float, float]],
+    label: str,
+) -> None:
+    """Reject traces that would otherwise create empty CSV rows or plots."""
+    missing = [
+        name
+        for name, trace in data.items()
+        if not any(_frequency_in_range(frequency) for frequency in trace)
+    ]
+    if missing:
+        low, high = FREQUENCY_RANGE_HZ
+        raise ValueError(
+            f"{label} DUT has no data within {low:g}–{high:g} Hz: "
+            + ", ".join(missing)
+        )
 
 
 def build_timestamped_output_dir(
@@ -733,7 +915,7 @@ def create_unique_output_dir(
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="解析 Audio Precision CSV，輸出 RMS / THD 數值與曲線圖。",
+        description="解析 Audio Precision CSV，輸出 RMS / THD / THD+N 數值與曲線圖。",
         epilog=(
             "使用範例：\n"
             "  完整輸出：\n"
@@ -774,7 +956,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--thd-compare-duts", "--thd-duts", dest="thd_compare_duts",
         nargs="+", default=None, metavar="DUT",
-        help="THD 比較圖的 DUT 編號或完整名稱；可用空格或逗號分隔",
+        help="THD / THD+N 比較圖的 DUT 編號或完整名稱；可用空格或逗號分隔",
     )
     parser.add_argument(
         "--compare-only", action="store_true",
@@ -786,7 +968,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--list-duts", action="store_true",
-        help="列出 RMS / THD DUT 編號後結束，不建立任何檔案",
+        help="列出 RMS / THD / THD+N DUT 編號後結束，不建立任何檔案",
     )
     parser.add_argument(
         "--no-timestamp", action="store_true",
@@ -802,15 +984,28 @@ def parse_arguments() -> argparse.Namespace:
 
 def load_measurements(
     input_path: Path,
-) -> tuple[dict[str, dict[float, float]], dict[str, dict[float, float]], list[str]]:
+) -> tuple[
+    dict[str, dict[float, float]],
+    dict[str, dict[float, float]],
+    list[str],
+    str,
+    str,
+]:
     """解析 CSV、修正 DUT 名稱，並分別回傳 RMS、THD 與配對紀錄。"""
     blocks = parse_ap_csv(input_path)
+    if not any(block.kind == "RMS" for block in blocks) or not any(
+        block.kind == "THD" for block in blocks
+    ):
+        raise ValueError(
+            "輸入檔案至少需要一個 RMS 區塊，以及一個 THD 或 THD+N 區塊。"
+        )
+    rms_unit, distortion_metric = validate_measurement_metadata(blocks)
     warnings = reconcile_dut_names(blocks)
     rms_data = build_measurement_map(blocks, "RMS")
     thd_data = build_measurement_map(blocks, "THD")
-    if not rms_data or not thd_data:
-        raise ValueError("輸入檔案至少需要一個 RMS 區塊與一個 THD 區塊。")
-    return rms_data, thd_data, warnings
+    validate_frequency_coverage(rms_data, "RMS")
+    validate_frequency_coverage(thd_data, distortion_metric)
+    return rms_data, thd_data, warnings, rms_unit, distortion_metric
 
 
 def run() -> None:
@@ -819,18 +1014,14 @@ def run() -> None:
     if not args.input_csv.is_file():
         raise FileNotFoundError(f"找不到輸入 CSV：{args.input_csv}")
     validate_settings()
-    rms_data, thd_data, warnings = load_measurements(args.input_csv)
+    rms_data, thd_data, warnings, rms_unit, distortion_metric = load_measurements(
+        args.input_csv
+    )
 
     if args.list_duts:
-        _print_dut_menu(list(rms_data), list(thd_data))
+        _print_dut_menu(list(rms_data), list(thd_data), distortion_metric)
         return
 
-    output_dir = create_unique_output_dir(
-        args.output_dir,
-        add_timestamp=ADD_OUTPUT_TIMESTAMP and not args.no_timestamp,
-    )
-    # 在開始寫檔前顯示實際位置，方便確認執行到的是具防覆蓋功能的版本。
-    print(f"全新輸出資料夾：{output_dir.resolve()}")
     # Command line 優先；未指定時才採用上方使用者設定。
     rms_requested = (
         args.rms_compare_duts
@@ -843,36 +1034,60 @@ def run() -> None:
         else THD_COMPARE_DUTS
     )
 
+    # 在建立輸出資料夾前先驗證選擇，避免錯誤指令留下空資料夾。
+    if not args.interactive:
+        _resolve_selection(rms_requested, list(rms_data), "RMS")
+        _resolve_selection(thd_requested, list(thd_data), distortion_metric)
+
+    output_dir = create_unique_output_dir(
+        args.output_dir,
+        add_timestamp=ADD_OUTPUT_TIMESTAMP and not args.no_timestamp,
+    )
+    # 在開始寫檔前顯示實際位置，方便確認執行到的是具防覆蓋功能的版本。
+    print(f"全新輸出資料夾：{output_dir.resolve()}")
+    print(f"量測格式：RMS ({rms_unit}) / {distortion_metric} (%)")
+
     _configure_plot_style()
 
     # compare-only 會跳過這一段，因此既有 CSV 與個別圖不會被重寫。
     if not args.compare_only:
         write_wide_csv(output_dir / "rms_level_values.csv", rms_data)
-        write_wide_csv(output_dir / "thd_values.csv", thd_data)
-        write_long_csv(output_dir / "rms_thd_all_values.csv", rms_data, thd_data)
+        distortion_file_token = _distortion_token(distortion_metric).casefold()
+        write_wide_csv(output_dir / f"{distortion_file_token}_values.csv", thd_data)
+        write_long_csv(
+            output_dir / "rms_thd_all_values.csv",
+            rms_data, thd_data, rms_unit, distortion_metric,
+        )
         if CREATE_ONE_CSV_PER_DUT:
-            write_per_dut_csvs(output_dir / "data_by_dut", rms_data, thd_data)
+            write_per_dut_csvs(
+                output_dir / "data_by_dut", rms_data, thd_data,
+                rms_unit, distortion_metric,
+            )
         create_individual_plots(
             output_dir / "plots" / "individual", rms_data, thd_data,
+            rms_unit, distortion_metric,
         )
         write_run_notes(
             output_dir / "run_notes.txt", args.input_csv,
             list(rms_data), list(thd_data), warnings,
+            rms_unit, distortion_metric,
         )
 
     # 一般模式輸出一組比較圖；互動模式則等待使用者連續選擇。
     if args.interactive:
         run_interactive_comparison(
             output_dir / "plots" / "comparison", rms_data, thd_data,
+            rms_unit, distortion_metric,
         )
     else:
         create_comparison_plots(
             output_dir / "plots" / "comparison",
             rms_data, thd_data, rms_requested, thd_requested,
+            rms_unit, distortion_metric,
         )
 
     print(f"完成。RMS DUT：{', '.join(rms_data)}")
-    print(f"完成。THD DUT：{', '.join(thd_data)}")
+    print(f"完成。{distortion_metric} DUT：{', '.join(thd_data)}")
     for warning in warnings:
         print(f"注意：{warning}")
     print(f"輸出資料夾：{output_dir.resolve()}")
